@@ -195,6 +195,17 @@ size_t vocr_textspot6_arena_bytes_flags(const vocr_textspot6 *m, unsigned max_wi
 int vocr_textspot6_find(const vocr_textspot6 *m, const VocrLinesImage *im, unsigned flags, void *arena,
                         size_t arena_bytes, VocrTextspot6Set *out);
 
+#ifndef VOCR_PARALLEL_DEFINED
+#define VOCR_PARALLEL_DEFINED
+/* A host's fork-join: task(ctx, i) for every i < n, on up to n threads; returns when all have. */
+typedef void (*vocr_parallel_task)(void *ctx, unsigned i);
+typedef void (*vocr_parallel_fn)(void *user, unsigned n, vocr_parallel_task task, void *ctx);
+#endif
+/* Hosts with spare cores: split each row of a trunk network's 3x3 layers (and the 1x1 layers after it) by pixel
+ * blocks across up to ways threads through fn (NULL or ways < 2: one thread, the default). Process-wide: set it
+ * while no call is running. Same bits either way. */
+void vocr_textspot6_set_parallel(vocr_parallel_fn fn, void *user, unsigned ways);
+
 /* The same through a row callback, as vocr_textspot_find_rows: the frame's rows once each in increasing order in
  * one pass, then (without VOCR_TEXTSPOT_NO_DARK) each box's rows once, top to bottom, boxes in output order. A NULL
  * row ends the call with VOCR_LINES_E_SOURCE and no boxes. */

@@ -265,6 +265,16 @@ const char *vocr_strerror(int rc);
 /* sizeof(vocr_model) and sizeof(vocr_ctx), for foreign-function bindings. */
 void vocr_sizes(size_t *model_bytes, size_t *ctx_bytes);
 
+#ifndef VOCR_PARALLEL_DEFINED
+#define VOCR_PARALLEL_DEFINED
+/* A host's fork-join: task(ctx, i) for every i < n, on up to n threads; returns when all have. */
+typedef void (*vocr_parallel_task)(void *ctx, unsigned i);
+typedef void (*vocr_parallel_fn)(void *user, unsigned n, vocr_parallel_task task, void *ctx);
+#endif
+/* Hosts with spare cores: split the W8I matrix products by position across up to ways threads through fn (NULL or
+ * ways < 2: one thread, the default). Process-wide: set it while no vocr_run is running. Same bits either way. */
+void vocr_set_parallel(vocr_parallel_fn fn, void *user, unsigned ways);
+
 #ifdef __cplusplus
 }
 #endif

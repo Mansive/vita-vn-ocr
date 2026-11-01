@@ -8,6 +8,12 @@
 #include <arm_neon.h>
 #define VOCR_NEON 1
 #endif
+/* x86 hosts built with -mavx2: the W8I matrix kernel (mm_i16) in AVX2, the same bits as the scalar one.
+ * -DVOCR_NO_AVX2 forces the scalar code. */
+#if defined(__AVX2__) && !defined(VOCR_NO_AVX2) && !defined(VOCR_NEON)
+#include <immintrin.h>
+#define VOCR_AVX2 1
+#endif
 /* PSP: the float matrix products on the VFPU, opt-in with -DVOCR_PSP_VFPU (psp/Makefile
  * VFPU=1). It does the scalar code's multiplies and adds in the same order, 4 lanes at a time,
  * which gives the same bits in PPSSPP; the real VFPU flushes denormals to zero, so a console
@@ -1015,6 +1021,29 @@ static VOCR_NOINLINE void k_conv1(const vocr_op *op, const float *win, float *ou
                 vst1q_f32(o + c0 + 12, a3);
             }
 #endif
+#ifdef VOCR_AVX2
+            /* AVX2: the scalar code's taps in its order, 8 channels per register, 32 then 8 per pass; each
+             * product and sum rounded separately (MULPS then ADDPS, no FMA), so the bits are the scalar code's */
+            for (; c0 + 8 <= C; c0 += c0 + 32 <= C ? 32u : 8u) {
+                const unsigned nr = c0 + 32 <= C ? 4u : 1u;
+                const __m256 z = _mm256_setzero_ps();
+                __m256 a[4];
+                unsigned r;
+                for (r = 0; r < 4; r++) a[r] = r < nr && op->bias ? _mm256_loadu_ps(op->bias + c0 + 8 * r) : z;
+                for (dy = dy0; dy < dy1; dy++)
+                    for (dx = 0; dx < kw; dx++) {
+                        const __m256 x = _mm256_set1_ps(win[(size_t)(t * op->sw + dx) * Hi + (unsigned)(r0 + (int)dy)]);
+                        const float *wt = op->w + (size_t)(dy * kw + dx) * C + c0;
+                        a[0] = _mm256_add_ps(a[0], _mm256_mul_ps(_mm256_loadu_ps(wt), x));
+                        if (nr == 4) {
+                            a[1] = _mm256_add_ps(a[1], _mm256_mul_ps(_mm256_loadu_ps(wt + 8), x));
+                            a[2] = _mm256_add_ps(a[2], _mm256_mul_ps(_mm256_loadu_ps(wt + 16), x));
+                            a[3] = _mm256_add_ps(a[3], _mm256_mul_ps(_mm256_loadu_ps(wt + 24), x));
+                        }
+                    }
+                for (r = 0; r < nr; r++) _mm256_storeu_ps(o + c0 + 8 * r, relu ? _mm256_max_ps(a[r], z) : a[r]);
+            }
+#endif
             /* Scalar: 8 channels per pass with the sums in registers (see mm_f32). */
             for (; c0 + 8 <= C; c0 += 8) {
                 float a0, a1, a2, a3, a4, a5, a6, a7, s[8];
@@ -1113,6 +1142,28 @@ static VOCR_NOINLINE void k_dw(const vocr_op *op, const float *win, float *out, 
                 vst1q_f32(o + c0 + 4, a1);
                 vst1q_f32(o + c0 + 8, a2);
                 vst1q_f32(o + c0 + 12, a3);
+            }
+#endif
+#ifdef VOCR_AVX2
+            /* AVX2: as k_conv1's, the input a vector of channels too */
+            for (; c0 + 8 <= C; c0 += c0 + 32 <= C ? 32u : 8u) {
+                const unsigned nr = c0 + 32 <= C ? 4u : 1u;
+                const __m256 z = _mm256_setzero_ps();
+                __m256 a[4];
+                unsigned r;
+                for (r = 0; r < 4; r++) a[r] = r < nr && op->bias ? _mm256_loadu_ps(op->bias + c0 + 8 * r) : z;
+                for (dy = dy0; dy < dy1; dy++)
+                    for (dx = 0; dx < kw; dx++) {
+                        const float *x = win + ((size_t)(t * op->sw + dx) * Hi + (unsigned)(r0 + (int)dy)) * C + c0;
+                        const float *wt = op->w + (size_t)(dy * kw + dx) * C + c0;
+                        a[0] = _mm256_add_ps(a[0], _mm256_mul_ps(_mm256_loadu_ps(wt), _mm256_loadu_ps(x)));
+                        if (nr == 4) {
+                            a[1] = _mm256_add_ps(a[1], _mm256_mul_ps(_mm256_loadu_ps(wt + 8), _mm256_loadu_ps(x + 8)));
+                            a[2] = _mm256_add_ps(a[2], _mm256_mul_ps(_mm256_loadu_ps(wt + 16), _mm256_loadu_ps(x + 16)));
+                            a[3] = _mm256_add_ps(a[3], _mm256_mul_ps(_mm256_loadu_ps(wt + 24), _mm256_loadu_ps(x + 24)));
+                        }
+                    }
+                for (r = 0; r < nr; r++) _mm256_storeu_ps(o + c0 + 8 * r, relu ? _mm256_max_ps(a[r], z) : a[r]);
             }
 #endif
             /* Scalar: 8 channels per pass with the sums in registers (see mm_f32). */
@@ -1446,9 +1497,9 @@ static void quant16(const float *x, size_t xs, unsigned K, unsigned P, int16_t *
  * S = 0 + float(c_0) + float(c_1) + ... (float adds, in order) and c_i is the exact int32
  * sum of q[k][j] * qx[p][k] over k in [512 i, 512 i + 512). 512 * 127 * 32767 < 2^31, so
  * no chunk can overflow, and for K <= 512 S is just float(sum). */
-static void mm_i16(const int8_t *qw, const float *scale, const float *bias, const int16_t *qx,
-                   const float *sx, unsigned K, unsigned P, float *y, size_t ys, const float *res,
-                   size_t rs, int relu)
+static void mm_i16_one(const int8_t *qw, const float *scale, const float *bias, const int16_t *qx,
+                       const float *sx, unsigned K, unsigned P, float *y, size_t ys, const float *res,
+                       size_t rs, int relu)
 {
     unsigned p = 0, q = 0, j, k, k0;
 #ifdef VOCR_NEON
@@ -1709,6 +1760,56 @@ static void mm_i16(const int8_t *qw, const float *scale, const float *bias, cons
 #undef VOCR_IHALF
 #undef VOCR_IROW
 #endif
+#ifdef VOCR_AVX2
+    /* AVX2: up to 4 positions x 8 outputs per pass. Each k pair's two weight rows are interleaved
+     * (w[k][0], w[k+1][0], w[k][1], ...) and widened to int16 once per pass, then one VPMADDWD per
+     * position takes w[k][j] * x[k] + w[k+1][j] * x[k+1] into output j's int32 lane. The integer
+     * sums are exact in any order (the chunk bound holds for the pair sums too), and the float steps
+     * are the scalar code's, in its order, so the bits are the scalar code's. */
+    {
+        const __m128i ilv = _mm_setr_epi8(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
+        const __m256 zero = _mm256_setzero_ps();
+        while (p < P) {
+            const unsigned np = P - p >= 4 ? 4u : 1u;
+            const int16_t *x0 = qx + (size_t)p * K, *x1 = x0 + K, *x2 = x1 + K, *x3 = x2 + K;
+            __m256 f0 = zero, f1 = zero, f2 = zero, f3 = zero; /* S = 0 + float(c_0) + ... */
+            unsigned i;
+            for (k0 = 0; k0 < K; k0 += W8I_CHUNK) {
+                const unsigned k1 = umin(K, k0 + W8I_CHUNK);
+                __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
+                for (k = k0; k < k1; k += 2) {
+                    const int two = k + 1 < k1;
+                    const int8_t *wk = qw + (size_t)k * 8;
+                    const __m128i w8 = two ? _mm_loadu_si128((const __m128i *)(const void *)wk)
+                                           : _mm_loadl_epi64((const __m128i *)(const void *)wk);
+                    const __m256i w16 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(w8, ilv));
+#define VOCR_XPAIR(X) _mm256_set1_epi32((int)((uint32_t)(uint16_t)(X)[k] | (two ? (uint32_t)(uint16_t)(X)[k + 1] << 16 : 0u)))
+                    a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w16, VOCR_XPAIR(x0)));
+                    if (np == 4) {
+                        a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(w16, VOCR_XPAIR(x1)));
+                        a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(w16, VOCR_XPAIR(x2)));
+                        a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(w16, VOCR_XPAIR(x3)));
+                    }
+#undef VOCR_XPAIR
+                }
+                f0 = _mm256_add_ps(f0, _mm256_cvtepi32_ps(a0));
+                f1 = _mm256_add_ps(f1, _mm256_cvtepi32_ps(a1));
+                f2 = _mm256_add_ps(f2, _mm256_cvtepi32_ps(a2));
+                f3 = _mm256_add_ps(f3, _mm256_cvtepi32_ps(a3));
+            }
+            for (i = 0; i < np; i++) {
+                const unsigned pi = p + i;
+                __m256 v = i == 0 ? f0 : i == 1 ? f1 : i == 2 ? f2 : f3;
+                v = _mm256_mul_ps(v, _mm256_mul_ps(_mm256_loadu_ps(scale), _mm256_set1_ps(sx[pi])));
+                if (bias) v = _mm256_add_ps(v, _mm256_loadu_ps(bias));
+                if (relu) v = _mm256_max_ps(v, zero); /* v > 0 ? v : 0, as relu_f */
+                if (res) v = _mm256_add_ps(v, _mm256_loadu_ps(res + pi * rs));
+                _mm256_storeu_ps(y + pi * ys, v);
+            }
+            p += np;
+        }
+    }
+#endif
     /* Scalar: one position x 8 outputs per pass, the 8 int32 sums in registers (see mm_f32;
      * two positions would need more integer registers than MIPS has). Integer sums are
      * exact, and each chunk's sums are added to fs in the same order, so the bits are the
@@ -1750,6 +1851,61 @@ static void mm_i16(const int8_t *qw, const float *scale, const float *bias, cons
             y[p * ys + j] = v;
         }
     }
+}
+
+/* the host's fork-join (vocr_set_parallel); a product smaller than MM_PAR_MIN (P * K) stays on one thread */
+#define MM_PAR_MIN 16384u
+static vocr_parallel_fn par_fn;
+static void *par_user;
+static unsigned par_ways;
+
+void vocr_set_parallel(vocr_parallel_fn fn, void *user, unsigned ways)
+{
+    par_fn = ways > 1u ? fn : NULL;
+    par_user = user;
+    par_ways = ways;
+}
+
+typedef struct {
+    const int8_t *qw;
+    const float *scale, *bias, *sx, *res;
+    const int16_t *qx;
+    float *y;
+    size_t ys, rs;
+    unsigned K, P, ways;
+    int relu;
+} mm_job;
+
+/* the first position of share i: a multiple of 4 (the kernels' position groups), P for i = ways */
+static unsigned mm_split(const mm_job *j, unsigned i)
+{
+    return i == j->ways ? j->P : i * (j->P / 4u) / j->ways * 4u;
+}
+
+static void mm_task(void *ctx, unsigned i)
+{
+    const mm_job *j = (const mm_job *)ctx;
+    unsigned p0 = mm_split(j, i), p1 = mm_split(j, i + 1u);
+    if (p1 > p0)
+        mm_i16_one(j->qw, j->scale, j->bias, j->qx + (size_t)p0 * j->K, j->sx + p0, j->K, p1 - p0, j->y + p0 * j->ys,
+                   j->ys, j->res ? j->res + p0 * j->rs : NULL, j->rs, j->relu);
+}
+
+/* mm_i16_one, its positions split across the host's threads when it is large enough: every position's outputs
+ * are computed alone, so the bits are the same */
+static void mm_i16(const int8_t *qw, const float *scale, const float *bias, const int16_t *qx,
+                   const float *sx, unsigned K, unsigned P, float *y, size_t ys, const float *res,
+                   size_t rs, int relu)
+{
+    mm_job j;
+    j.ways = par_fn && (size_t)P * K >= MM_PAR_MIN ? umin(par_ways, P / 4u) : 1u;
+    if (j.ways < 2u) {
+        mm_i16_one(qw, scale, bias, qx, sx, K, P, y, ys, res, rs, relu);
+        return;
+    }
+    j.qw = qw, j.scale = scale, j.bias = bias, j.sx = sx, j.res = res, j.qx = qx, j.y = y;
+    j.ys = ys, j.rs = rs, j.K = K, j.P = P, j.relu = relu;
+    par_fn(par_user, j.ways, mm_task, &j);
 }
 
 /* ---------------------------------------------------------------- run */
@@ -1935,6 +2091,97 @@ static void lanes_argmax(const vocr_lane_i32 *lk, const vocr_lane_u32 *li, unsig
  * A last block of fewer than 8 classes goes through the per-class loop after the full ones. The
  * head gate (o->fidx) changes only which frames the batch holds: frame f of the batch is the line's frame
  * o->fidx[f] (else o->frame + f), and a frame the gate skipped between two of them reads as a blank. */
+#ifndef VOCR_NEON
+/* The head's frames split across the host's threads (vocr_set_parallel; W8I): each frame's state (bestv, besti,
+ * top-K, logits) is its own and still takes the blocks in order, so the bits are the same. Shares are multiples
+ * of 4 frames; range(job, fa, fb) runs frames [fa, fb). */
+typedef struct head_job_ head_job;
+struct head_job_ {
+    const vocr_ctx *c;
+    const out_t *o;
+    unsigned nf, n, ways;   /* the batch's frames; the frames split (level 2: the fired ones) */
+    const uint32_t *fm;     /* level 2: the fired frames */
+    void (*range)(const head_job *j, unsigned fa, unsigned fb);
+};
+
+static unsigned head_split(const head_job *j, unsigned i)
+{
+    return i == j->ways ? j->n : i * (j->n / 4u) / j->ways * 4u;
+}
+
+static void head_task(void *ctx, unsigned i)
+{
+    const head_job *j = (const head_job *)ctx;
+    unsigned fa = head_split(j, i), fb = head_split(j, i + 1u);
+    if (fb > fa) j->range(j, fa, fb);
+}
+
+/* range over [0, n), on the host's threads when there are enough frames; 0 if not split (the caller runs it) */
+static int head_par(const vocr_ctx *c, const out_t *o, unsigned nf, unsigned n, const uint32_t *fm,
+                    void (*range)(const head_job *, unsigned, unsigned))
+{
+    head_job j;
+    if (!par_fn || c->mode != VOCR_MODE_W8I || n < 16u) return 0;
+    j.c = c, j.o = o, j.nf = nf, j.n = n, j.fm = fm, j.range = range;
+    j.ways = umin(par_ways, n / 4u);
+    par_fn(par_user, j.ways, head_task, &j);
+    return 1;
+}
+
+/* run_head's blocks on frames [fa, fb) (W8I) */
+static void head1_range(const head_job *jb, unsigned fa, unsigned fb)
+{
+    const vocr_ctx *c = jb->c;
+    const out_t *o = jb->o;
+    const vocr_model *m = c->model;
+    const unsigned L = m->n_ops, N = m->n_classes;
+    const vocr_op *op = &m->op[L - 1];
+    const unsigned K = op->k;
+    float *bestv = at(c, c->bestv_off);
+    uint32_t *besti = (uint32_t *)(void *)(c->arena + c->besti_off);
+    const unsigned char *scr = c->arena + c->op[L - 1].scr_off;
+    const int16_t *qx = (const int16_t *)(const void *)scr;
+    const float *sx = (const float *)(const void *)(scr + al16((size_t)jb->nf * K * 2u));
+    vocr_extra *ex = o->ex;
+    const unsigned TK = o->topk;
+    const uint16_t *fx = o->fidx;
+    unsigned nb, f0, q, j;
+    float tmp[4 * 8];
+    for (nb = 0; nb < op->cout_pad / 8u; nb++) {
+        const float *b = op->bias ? op->bias + nb * 8 : NULL;
+        for (f0 = fa; f0 < fb; f0 += 4u) {
+            const unsigned pn = umin(4u, fb - f0);
+            mm_i16_one(op->q + (size_t)nb * K * 8, op->scale + nb * 8, b, qx + (size_t)f0 * K, sx + f0, K, pn, tmp,
+                       8, NULL, 0, 0);
+            for (q = 0; q < pn; q++) {
+                const unsigned frame = fx ? (unsigned)fx[f0 + q] : o->frame + f0 + q;
+                float *tv = TK ? ex->topk_logit + (size_t)frame * TK : NULL;
+                uint16_t *tc = TK ? ex->topk_class + (size_t)frame * TK : NULL;
+                for (j = 0; j < 8 && nb * 8 + j < N; j++) {
+                    const float v = tmp[q * 8 + j];
+                    if (ex && ex->logits && frame < ex->cap_frames) ex->logits[(size_t)frame * N + nb * 8 + j] = v;
+                    if (v > bestv[f0 + q]) {
+                        bestv[f0 + q] = v;
+                        besti[f0 + q] = nb * 8 + j;
+                    }
+                    if (TK && v > tv[TK - 1]) {
+                        unsigned p = TK - 1;
+                        while (p && v > tv[p - 1]) {
+                            tv[p] = tv[p - 1];
+                            tc[p] = tc[p - 1];
+                            p--;
+                        }
+                        tv[p] = v;
+                        tc[p] = (uint16_t)(nb * 8 + j);
+                    }
+                }
+                if (TK && !nb && ex->blank_logit) ex->blank_logit[frame] = tmp[q * 8];
+            }
+        }
+    }
+}
+#endif
+
 static void run_head(const vocr_ctx *c, unsigned nf, out_t *o)
 {
     const vocr_model *m = c->model;
@@ -1982,6 +2229,9 @@ static void run_head(const vocr_ctx *c, unsigned nf, out_t *o)
             }
         }
     if (c->mode == VOCR_MODE_W8I) quant16(x, K, K, nf, qx, sx);
+#ifndef VOCR_NEON
+    if (head_par(c, o, nf, nf, NULL, head1_range)) goto scanned;
+#endif
 #ifdef VOCR_NEON
     if (c->mode == VOCR_MODE_W8I && K >= 16u) {
         step = VOCR_HEAD_CHUNK;
@@ -2152,6 +2402,8 @@ static void run_head(const vocr_ctx *c, unsigned nf, out_t *o)
     }
 #ifdef VOCR_NEON
     if (n_lanes && n_lanes == op->cout_pad / 8u) lanes_argmax(lk, li, nf, bestv, besti);
+#else
+scanned:
 #endif
     for (f = 0; f < nf; f++, o->frame++) {
         if (fx && fx[f] != o->frame) { /* frames the gate skipped since the last one: blanks */
@@ -2312,6 +2564,82 @@ static void h2_update(const float *v, unsigned cls0, unsigned N, float *bestv, u
     }
 }
 
+#ifndef VOCR_NEON
+/* run_head2's level 1 on frames [fa, fb) (W8I) */
+static void h2_l1_range(const head_job *jb, unsigned fa, unsigned fb)
+{
+    const vocr_ctx *c = jb->c;
+    const out_t *o = jb->o;
+    const vocr_model *m = c->model;
+    const unsigned L = m->n_ops, N = m->n_classes;
+    const vocr_op *op = &m->op[L - 1];
+    const unsigned K = op->k, B1 = m->two.l1_blocks;
+    float *bestv = at(c, c->bestv_off), *nbv = at(c, c->nbv_off), *b0v = at(c, c->b0_off);
+    uint32_t *besti = (uint32_t *)(void *)(c->arena + c->besti_off);
+    const unsigned char *scr = c->arena + c->op[L - 1].scr_off;
+    const int16_t *qx = (const int16_t *)(const void *)scr;
+    const float *sx = (const float *)(const void *)(scr + al16((size_t)jb->nf * K * 2u));
+    vocr_extra *ex = o->ex;
+    const unsigned TK = o->topk;
+    const uint16_t *fx = o->fidx;
+    unsigned nb, f0, q;
+    float tmp[4 * 8];
+    for (nb = 0; nb < B1; nb++) {
+        const float *b = op->bias ? op->bias + nb * 8 : NULL;
+        for (f0 = fa; f0 < fb; f0 += 4u) {
+            const unsigned pn = umin(4u, fb - f0);
+            mm_i16_one(op->q + (size_t)nb * K * 8, op->scale + nb * 8, b, qx + (size_t)f0 * K, sx + f0, K, pn, tmp, 8,
+                       NULL, 0, 0);
+            for (q = 0; q < pn; q++) {
+                const unsigned fr = f0 + q, frame = fx ? (unsigned)fx[fr] : o->frame + fr;
+                float *tv = TK ? ex->topk_logit + (size_t)frame * TK : NULL;
+                uint16_t *tc = TK ? ex->topk_class + (size_t)frame * TK : NULL;
+                if (!nb) {
+                    b0v[fr] = tmp[q * 8];
+                    if (TK && ex->blank_logit) ex->blank_logit[frame] = tmp[q * 8];
+                }
+                h2_update(tmp + q * 8, nb * 8, N, bestv + fr, besti + fr, nbv + fr, tv, tc, TK);
+            }
+        }
+    }
+}
+
+/* run_head2's level 2 on the fired frames fm[fa .. fb) (W8I; their inputs packed to the front) */
+static void h2_l2_range(const head_job *jb, unsigned fa, unsigned fb)
+{
+    const vocr_ctx *c = jb->c;
+    const out_t *o = jb->o;
+    const vocr_model *m = c->model;
+    const unsigned L = m->n_ops, N = m->n_classes;
+    const vocr_op *op = &m->op[L - 1];
+    const unsigned K = op->k, B1 = m->two.l1_blocks, NB = op->cout_pad / 8u;
+    float *bestv = at(c, c->bestv_off);
+    uint32_t *besti = (uint32_t *)(void *)(c->arena + c->besti_off);
+    const unsigned char *scr = c->arena + c->op[L - 1].scr_off;
+    const int16_t *qx = (const int16_t *)(const void *)scr;
+    const float *sx = (const float *)(const void *)(scr + al16((size_t)jb->nf * K * 2u));
+    vocr_extra *ex = o->ex;
+    const unsigned TK = o->topk;
+    const uint16_t *fx = o->fidx;
+    unsigned nb, f0, q;
+    float tmp[4 * 8];
+    for (nb = B1; nb < NB; nb++) {
+        const float *b = op->bias ? op->bias + nb * 8 : NULL;
+        for (f0 = fa; f0 < fb; f0 += 4u) {
+            const unsigned pn = umin(4u, fb - f0);
+            mm_i16_one(op->q + (size_t)nb * K * 8, op->scale + nb * 8, b, qx + (size_t)f0 * K, sx + f0, K, pn, tmp, 8,
+                       NULL, 0, 0);
+            for (q = 0; q < pn; q++) {
+                const unsigned fr = jb->fm[f0 + q], frame = fx ? (unsigned)fx[fr] : o->frame + fr;
+                h2_update(tmp + q * 8, nb * 8, N, bestv + fr, besti + fr, NULL,
+                          TK ? ex->topk_logit + (size_t)frame * TK : NULL,
+                          TK ? ex->topk_class + (size_t)frame * TK : NULL, TK);
+            }
+        }
+    }
+}
+#endif
+
 static void run_head2(const vocr_ctx *c, unsigned nf, out_t *o)
 {
     const vocr_model *m = c->model;
@@ -2355,6 +2683,9 @@ static void run_head2(const vocr_ctx *c, unsigned nf, out_t *o)
         }
     quant16(x, K, K, nf, qx, sx);
     /* level 1: every frame */
+#ifndef VOCR_NEON
+    if (!head_par(c, o, nf, nf, NULL, h2_l1_range))
+#endif
     for (nb = 0; nb < B1; nb++) {
         const float *b = op->bias ? op->bias + nb * 8 : NULL;
         if (fl) dequant8(op->q + (size_t)nb * K * 8, op->scale + nb * 8, K, wf);
@@ -2406,6 +2737,9 @@ static void run_head2(const vocr_ctx *c, unsigned nf, out_t *o)
                     sx[j] = sx[fm[j]];
                 }
             }
+#ifndef VOCR_NEON
+        if (!head_par(c, o, nf, nfire, fm, h2_l2_range))
+#endif
         for (nb = B1; nb < NB; nb++) {
             const float *b = op->bias ? op->bias + nb * 8 : NULL;
             if (fl) dequant8(op->q + (size_t)nb * K * 8, op->scale + nb * 8, K, wf);
@@ -2576,6 +2910,33 @@ static void ring_shift(float *ring, unsigned cap, unsigned halo, unsigned col)
 
 /* Compute output columns [j0, j0 + n) of op i (wout of them exist) into its
  * destination; u is the mini-tile index for the last front op, else 0. */
+/* A float conv (k_conv1 / k_dw) on output columns [t0, t1), split by columns across the host's threads when there
+ * are enough of them: each column is computed alone, so the bits are the same. */
+typedef struct {
+    const vocr_op *op;
+    const float *win;
+    float *out;
+    unsigned t0, n, ways;
+} conv_job;
+
+static void conv_task(void *ctx, unsigned i)
+{
+    const conv_job *j = (const conv_job *)ctx;
+    const unsigned a = j->t0 + i * j->n / j->ways, b = j->t0 + (i + 1u) * j->n / j->ways;
+    float *o = j->out + (size_t)(a - j->t0) * j->op->h_out * j->op->cout;
+    if (j->op->type == T_CONV) k_conv1(j->op, j->win, o, a, b);
+    else k_dw(j->op, j->win, o, a, b);
+}
+
+static void conv_cols(const vocr_op *op, const float *win, float *out, unsigned t0, unsigned t1)
+{
+    conv_job j;
+    j.op = op, j.win = win, j.out = out, j.t0 = t0, j.n = t1 - t0;
+    j.ways = par_fn && j.n >= 8u ? umin(par_ways, j.n / 4u) : 1u;
+    if (j.ways > 1u) par_fn(par_user, j.ways, conv_task, &j);
+    else conv_task(&j, 0);
+}
+
 static void step_op(const vocr_ctx *c, unsigned i, long j0, unsigned n, unsigned wout,
                     unsigned u, unsigned *acc_fill)
 {
@@ -2604,10 +2965,8 @@ static void step_op(const vocr_ctx *c, unsigned i, long j0, unsigned n, unsigned
         out = dst + (size_t)t0 * oc;
     }
     if (t1 > t0) {
-        if (op->type == T_CONV) {
-            k_conv1(op, at(c, p->in_off), out, t0, t1);
-        } else if (op->type == T_DW) {
-            k_dw(op, at(c, p->in_off), out, t0, t1);
+        if (op->type == T_CONV || op->type == T_DW) {
+            conv_cols(op, at(c, p->in_off), out, t0, t1);
         } else {
             const unsigned rows = op->flags & F_COLLAPSE ? 1u : op->h_in;
             const float *res = NULL;
