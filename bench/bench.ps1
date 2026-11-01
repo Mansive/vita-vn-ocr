@@ -59,6 +59,7 @@ public static class Ppm {
 $conv = Join-Path $build 'frames'
 New-Item -ItemType Directory -Force $conv | Out-Null
 $list = @()
+if (-not (Test-Path $Frames)) { throw "no folder ${Frames}: put a few screenshots in bench\frames\, or pass -Frames DIR" }
 foreach ($f in Get-ChildItem $Frames -File | Sort-Object Name) {
     $ext = $f.Extension.ToLower()
     if ($ext -eq '.ppm' -or $ext -eq '.pgm') { $list += $f.FullName }
