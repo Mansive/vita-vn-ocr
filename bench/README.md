@@ -9,13 +9,9 @@ Times VOCR's C runtime (`../runtime`) on your own screenshots, in three builds:
 
 ## Build
 
-You need Windows, a CPU with AVX2 (Intel Haswell / AMD Zen or newer) and zig, a C compiler:
-
-```
-winget install zig.zig
-```
-
-or `pip install ziglang==0.16.0`. Then, in this folder:
+You need Windows, a CPU with AVX2 (Intel Haswell / AMD Zen or newer) and a GCC/Clang-style C compiler: one you
+have (`set CC=clang` or `set CC=gcc`), or zig (`winget install zig.zig` or `pip install ziglang==0.16.0`, about
+345 MB installed). Then, in this folder:
 
 ```
 powershell -ExecutionPolicy Bypass -File fetch_models.ps1
@@ -72,25 +68,6 @@ build\ocr_page.exe frames\shot.ppm --models models --lm models\vocr_lm6_o3_1000k
 ```
 
 (`ocr_page` reads binary `.ppm` / `.pgm`; `bench.ps1` leaves converted copies in `build\frames\`.)
-
-## Next: AVX-512 kernels for Zen 4 / Zen 5 (open)
-
-Written on a Ryzen 7 5800X3D (Zen 3, no AVX-512), so nothing here uses AVX-512 by hand yet. On a Zen 5 CPU
-(e.g. Ryzen 7 9800X3D: full 512-bit units, AVX-512 VNNI, AVX-VNNI) these are the places to try, measured with
-`bench.ps1` on that machine:
-
-- **Integer products** (W8I recognizer, `runtime/vocr.c` around `_mm256_madd_epi16` + `_mm256_add_epi32`, ~line 1620;
-  the line finder's `MADD` macro in `runtime/vocr_textspot6.c`, ~line 1381): `vpdpwssd` (`_mm512_dpwssd_epi32`, or the
-  256-bit `_mm256_dpwssd_avx_epi32`) does the multiply-add-accumulate in one instruction with the same int32 result,
-  and 512 bits cover twice the outputs per instruction.
-- **Float front end** (`runtime/vocr.c`, `_mm256_mul_ps` + `_mm256_add_ps` across outputs, ~lines 941 and 1063):
-  widen to 16 lanes. Keep the multiply and the add separate (no FMA) and each output's order of additions unchanged,
-  or the result changes.
-
-Rules: output stays bit-identical to the scalar build (`bench.ps1`'s parity check must say `same` for every build);
-keep `-ffp-contract=off`; put AVX-512 behind its own guard (e.g. `#ifdef __AVX512F__`) and a `build.bat avx512` option,
-so the AVX2 and scalar builds don't change; the console runtime stays plain C (`VOCR_NO_AVX2` builds none of this).
-Report page / per-line / finder times before and after, from `bench.ps1` with the same frames.
 
 ## Licence
 

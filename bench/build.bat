@@ -6,12 +6,12 @@ rem                       build\ocr_page_scalar.exe, parity_scalar.exe  plain C,
 rem   build.bat native    also build\ocr_page_native.exe, parity_native.exe: the AVX2 build tuned for this machine's
 rem                       CPU (-march=native); runs only on CPUs like it
 rem
-rem zig: from PATH, else "python -m ziglang" (pip install ziglang==0.16.0), else install it: winget install zig.zig
+rem Compiler: %CC% if set (any GCC/Clang-style one, e.g. set CC=clang), else zig from PATH, else "python -m ziglang"
+rem (pip install ziglang==0.16.0), else install zig: winget install zig.zig
 setlocal
 cd /d "%~dp0"
 
-set CC=
-where zig >nul 2>nul && set CC=zig cc
+if not defined CC where zig >nul 2>nul && set CC=zig cc
 if not defined CC (
     python -c "import ziglang" >nul 2>nul && set CC=python -m ziglang cc
 )
